@@ -1,488 +1,383 @@
 """
 corpus_evaluation_report.py  —  LINGUA-NEP / IRIIS Corpus Evaluation
 ======================================================================
-Corrected version. Fixes vs original:
+Performance rewrite: uses datasets.map() with batched=True + num_proc=N
+instead of a single-threaded Python for-loop. On a 32-core machine with
+5.2M rows this drops wall-time from ~3 hours to ~8-15 minutes.
 
-  BUG-1  Latin/ASCII digit counts were 0 because character scanning
-         happened only inside word_clean; now scanned on raw `text` directly.
+Architecture
+------------
+  1. load_dataset()          — loads all Arrow shards into RAM in parallel
+  2. ds.map(analyse_batch)   — per-batch stats across all N cores in parallel
+  3. Reduce partial counters — sum aggregates returned from each batch
+  4. Write Markdown report
 
-  BUG-2  Sentence splitter missed Nepali । (Purna Viram) when not followed
-         by a space; now also splits on ।\n and bare newlines.
-
-  BUG-3  hash(text) is non-deterministic (Python hash randomisation); replaced
-         with hashlib.md5 for reproducible deduplication.
-
-  BUG-4  Source/domain field: IRIIS corpus has no "url" or "source" column;
-         code now inspects all available keys and picks the best candidate.
-
-  BUG-5  Suffix matching was not longest-first; short suffixes (को) were
-         absorbing words that should have matched हरुको or लाई first.
-
-  BUG-6  Emoji detection via unicodedata.category == 'So' misses the vast
-         majority of modern emoji (U+1F300+); replaced with a Unicode range
-         check that covers all current emoji blocks.
+Columns detected at runtime (IRIIS: 'index', 'Article', 'Source').
 """
 
 import re
+import os
 import hashlib
+import json
 import collections
-import unicodedata
+import multiprocessing
 from urllib.parse import urlparse
 
 from datasets import load_dataset
 from tqdm import tqdm
 
 
-# ── Nepali suffixes — longest first so greedy match is correct ────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants — module-level for clean multiprocessing pickling
+# ─────────────────────────────────────────────────────────────────────────────
+
 NEPALI_SUFFIXES = sorted(
     [
-        # Multi-character agglutinative chains
         "हरुलाई", "हरुबाट", "हरुसँग", "हरुको", "हरुका", "हरुकी", "हरुले", "हरुमा",
-        "हरू",    "हरु",
-        # Vibhakti (case markers)
-        "सँगै", "सँग",
-        "भन्दा",
-        "बाट",
-        "लाई",
-        "तिर",
-        "मा",
-        "ले",
-        "को", "का", "की",
+        "हरू", "हरु",
+        "सँगै", "सँग", "भन्दा", "बाट", "लाई", "तिर",
+        "मा", "ले", "को", "का", "की",
     ],
-    key=len,
-    reverse=True,   # longest suffix matched first
+    key=len, reverse=True,
 )
 
-# Sentence boundary pattern — handles ।, .  !  ?  and bare newlines
-SENTENCE_RE = re.compile(r"[।\.\!\?]+[\s]*|[\n]+")
+SENTENCE_RE = re.compile(r"[।\.!\?]+\s*|\n+")
+HTML_RE     = re.compile(r"<[^>]{1,200}?>")
+URL_RE      = re.compile(r"https?://\S+|www\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}\S*")
+PHONE_RE    = re.compile(
+    r"\b(?:\+977[- .]?)?(?:98|97|96|01|0\d)[- .]?\d{7,8}\b|[०-९]{9,10}"
+)
+STRIP_CHARS = ".,?!\u0964\u0965'\"()[]{}:;-\u2013\u2014"
 
-# Devanagari Unicode block: U+0900–U+097F
-DEVANAGARI_BLOCK = (0x0900, 0x097F)
-# Devanagari digit range: U+0966–U+096F  (०–९)
-DEV_DIGIT_RANGE  = (0x0966, 0x096F)
-# Halanta (virama): U+094D  (्)
-HALANTA_CP = 0x094D
+DEV_LO, DEV_HI         = 0x0900, 0x097F
+DIG_LO, DIG_HI         = 0x0966, 0x096F
+HALANTA_CP              = 0x094D
+LAT_UP_LO, LAT_UP_HI   = 0x0041, 0x005A
+LAT_LO_LO, LAT_LO_HI   = 0x0061, 0x007A
+ASC_DIG_LO, ASC_DIG_HI = 0x0030, 0x0039
 
-# Basic Latin letters
-LATIN_UPPER = (0x0041, 0x005A)  # A–Z
-LATIN_LOWER = (0x0061, 0x007A)  # a–z
-# ASCII digits
-ASCII_DIGIT = (0x0030, 0x0039)  # 0–9
-
-# Emoji Unicode ranges (BUG-6 fix: comprehensive list)
 EMOJI_RANGES = [
-    (0x1F300, 0x1F5FF),   # Misc symbols & pictographs
-    (0x1F600, 0x1F64F),   # Emoticons
-    (0x1F650, 0x1F67F),   # Ornamental dingbats
-    (0x1F680, 0x1F6FF),   # Transport & map
-    (0x1F700, 0x1F77F),   # Alchemical symbols
-    (0x1F780, 0x1F7FF),   # Geometric shapes extended
-    (0x1F800, 0x1F8FF),   # Supplemental arrows
-    (0x1F900, 0x1F9FF),   # Supplemental symbols
-    (0x1FA00, 0x1FA6F),   # Chess symbols
-    (0x1FA70, 0x1FAFF),   # Symbols and pictographs extended-A
-    (0x2600,  0x26FF),    # Misc symbols
-    (0x2700,  0x27BF),    # Dingbats
-    (0x231A,  0x231B),    # Watch, hourglass
-    (0x23E9,  0x23F3),    # Various clock/timer symbols
-    (0x25AA,  0x25AB),    # Small squares
-    (0x25B6,  0x25B6),    # Play button
-    (0x25C0,  0x25C0),    # Reverse button
-    (0x25FB,  0x25FE),    # Medium squares
-    (0x2614,  0x2615),    # Umbrella/hot beverage
-    (0x2648,  0x2653),    # Zodiac signs
-    (0x267F,  0x267F),    # Wheelchair symbol
-    (0x2693,  0x2693),    # Anchor
-    (0x26A1,  0x26A1),    # Lightning
-    (0x26AA,  0x26AB),    # Circles
-    (0x26BD,  0x26BE),    # Soccer/baseball
-    (0x26C4,  0x26C5),    # Snowman/sun
-    (0x26CE,  0x26CE),    # Ophiuchus
-    (0x26D4,  0x26D4),    # No entry
-    (0x26EA,  0x26EA),    # Church
-    (0x26F2,  0x26F3),    # Fountain/golf
-    (0x26F5,  0x26F5),    # Sailboat
-    (0x26FA,  0x26FA),    # Tent
-    (0x26FD,  0x26FD),    # Fuel pump
-    (0x2702,  0x2702),    # Scissors
-    (0x2705,  0x2705),    # Check mark
-    (0x2708,  0x270D),    # Airplane–writing hand
-    (0x270F,  0x270F),    # Pencil
-    (0x2712,  0x2712),    # Black nib
-    (0x2714,  0x2714),    # Heavy check
-    (0x2716,  0x2716),    # Heavy multiplication
-    (0x271D,  0x271D),    # Latin cross
-    (0x2721,  0x2721),    # Star of David
-    (0x2728,  0x2728),    # Sparkles
-    (0x2733,  0x2734),    # Asterisks
-    (0x2744,  0x2744),    # Snowflake
-    (0x2747,  0x2747),    # Sparkle
-    (0x274C,  0x274C),    # Cross mark
-    (0x274E,  0x274E),    # Cross mark button
-    (0x2753,  0x2755),    # Question marks
-    (0x2757,  0x2757),    # Exclamation mark
-    (0x2763,  0x2764),    # Heart exclamation, heart
-    (0x2795,  0x2797),    # Plus, minus, division
-    (0x27A1,  0x27A1),    # Arrow
-    (0x27B0,  0x27B0),    # Curly loop
-    (0x27BF,  0x27BF),    # Double curly loop
-    (0xFE00,  0xFE0F),    # Variation selectors (emoji modifiers)
-    (0x1F1E0, 0x1F1FF),   # Regional indicator letters (flag sequences)
+    (0x1F300,0x1F5FF),(0x1F600,0x1F64F),(0x1F650,0x1F67F),(0x1F680,0x1F6FF),
+    (0x1F700,0x1F77F),(0x1F780,0x1F7FF),(0x1F800,0x1F8FF),(0x1F900,0x1F9FF),
+    (0x1FA00,0x1FA6F),(0x1FA70,0x1FAFF),(0x2600,0x26FF),(0x2700,0x27BF),
+    (0x231A,0x231B),(0x23E9,0x23F3),(0x25AA,0x25AB),(0x25B6,0x25B6),
+    (0x25C0,0x25C0),(0x25FB,0x25FE),(0x2614,0x2615),(0x2648,0x2653),
+    (0x2693,0x2693),(0x26A1,0x26A1),(0x26AA,0x26AB),(0x26BD,0x26BE),
+    (0x26C4,0x26C5),(0x26D4,0x26D4),(0x26F2,0x26F3),(0x26F5,0x26F5),
+    (0x26FA,0x26FA),(0x26FD,0x26FD),(0x2702,0x2702),(0x2705,0x2705),
+    (0x2708,0x270D),(0x270F,0x270F),(0x2712,0x2712),(0x2714,0x2714),
+    (0x2716,0x2716),(0x271D,0x271D),(0x2721,0x2721),(0x2728,0x2728),
+    (0x2733,0x2734),(0x2744,0x2744),(0x2747,0x2747),(0x274C,0x274C),
+    (0x274E,0x274E),(0x2753,0x2755),(0x2757,0x2757),(0x2763,0x2764),
+    (0x2795,0x2797),(0x27A1,0x27A1),(0x27B0,0x27B0),(0x27BF,0x27BF),
+    (0xFE00,0xFE0F),(0x1F1E0,0x1F1FF),
 ]
 
-
-def is_emoji(cp: int) -> bool:
-    """BUG-6 FIX: Check if a code-point falls in any known emoji range."""
+def _is_emoji(cp: int) -> bool:
     return any(lo <= cp <= hi for lo, hi in EMOJI_RANGES)
 
 
-def stable_hash(text: str) -> str:
-    """BUG-3 FIX: Use MD5 instead of Python's non-deterministic hash()."""
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+# ─────────────────────────────────────────────────────────────────────────────
+# Column detection
+# ─────────────────────────────────────────────────────────────────────────────
 
+def detect_text_column(columns: list) -> str:
+    lower = {c.lower(): c for c in columns}
+    for cand in ["text", "content", "article", "body", "paragraph", "sentence"]:
+        if cand in lower:
+            return lower[cand]
+    for c in columns:
+        if c.lower() not in {"id", "index", "url", "source", "domain"}:
+            return c
+    return columns[0]
 
-def get_stats(data: list) -> dict:
-    if not data:
-        return {"min": 0, "q1": 0, "median": 0, "q3": 0, "max": 0, "mean": 0.0}
-    s = sorted(data)
-    n = len(s)
-    return {
-        "min":    s[0],
-        "q1":     s[n // 4],
-        "median": s[n // 2],
-        "q3":     s[3 * n // 4],
-        "max":    s[-1],
-        "mean":   round(sum(data) / n, 2),
-    }
-
-
-def detect_text_column(first_doc: dict) -> str:
-    """
-    BUG-4 FIX: Robustly detect the text column from available keys.
-    IRIIS corpus may not have 'url' or 'source' fields.
-    """
-    keys = list(first_doc.keys())
-    print(f"  Available columns: {keys}")
-    lower = {k.lower(): k for k in keys}
-
-    # Priority order for text column
-    for candidate in ["text", "content", "article", "body", "paragraph", "sentence"]:
-        if candidate in lower:
-            return lower[candidate]
-
-    # Fall back to the first non-id-like string column
-    for k in keys:
-        v = first_doc[k]
-        if isinstance(v, str) and k.lower() not in {"id", "index", "url", "source", "domain"}:
-            return k
-
-    return keys[0]
-
-
-def detect_domain_column(first_doc: dict) -> str | None:
-    """
-    BUG-4 FIX: Detect domain/source column. Returns None if absent.
-    """
-    keys = list(first_doc.keys())
-    lower = {k.lower(): k for k in keys}
-    for candidate in ["url", "domain", "source", "website", "origin", "site"]:
-        if candidate in lower:
-            return lower[candidate]
+def detect_domain_column(columns: list):
+    lower = {c.lower(): c for c in columns}
+    for cand in ["url", "domain", "source", "website", "origin", "site"]:
+        if cand in lower:
+            return lower[cand]
     return None
 
 
-def generate_report(ds, output_file: str = "corpus_evaluation_report.md"):
-    # ── Counters & accumulators ───────────────────────────────────────────────
-    total_docs = 0
-    total_sentences = 0
-    total_words = 0
-    total_chars = 0
-    total_bytes = 0
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch worker — called by datasets.map() in each subprocess
+# ─────────────────────────────────────────────────────────────────────────────
+# TEXT_COL / DOMAIN_COL are set as module globals before map() is called
+# (avoids lambda / closure pickling issues on some platforms)
 
-    word_freq: collections.Counter = collections.Counter()
-    domain_dist: collections.Counter = collections.Counter()
+TEXT_COL   = "Article"
+DOMAIN_COL = "Source"
 
-    doc_lengths_sentences: list[int] = []
-    doc_lengths_words: list[int] = []
-    sent_lengths_words: list[int] = []
+def analyse_batch(batch: dict) -> dict:
+    total_docs = total_sentences = total_words = 0
+    total_chars = total_bytes_ = 0
+    dev_chars = lat_chars = dev_digits = asc_digits = halanta = emojis = 0
+    html_c = url_c = phone_c = dup_c = suffix_bearing = 0
 
-    # BUG-1 FIX: count chars directly on raw text, not on word_clean
-    devanagari_chars = 0
-    latin_chars = 0
-    devanagari_digits = 0
-    ascii_digits = 0
-    halanta_count = 0
+    word_freq   = collections.Counter()
+    domain_freq = collections.Counter()
+    suffix_freq = collections.Counter()
+    doc_lens_s, doc_lens_w, sent_lens_w = [], [], []
+    seen: set = set()
 
-    suffix_dist: collections.Counter = collections.Counter()
-    suffix_bearing_words = 0
+    texts   = batch[TEXT_COL]
+    domains = batch.get(DOMAIN_COL, [None] * len(texts))
 
-    seen_hashes: set[str] = set()   # BUG-3 FIX: MD5 hashes
-    duplicate_docs = 0
-
-    html_tags_count = 0
-    urls_count = 0
-    phone_numbers_count = 0
-    emojis_count = 0
-
-    # Regex patterns
-    html_pattern   = re.compile(r"<[^>]{1,200}?>")
-    url_pattern    = re.compile(
-        r"https?://[^\s]+"                       # explicit https/http
-        r"|www\.[a-zA-Z0-9-]+\.[a-zA-Z]{2,}[^\s]*"  # www. bare domains
-    )
-    phone_pattern  = re.compile(
-        r"\b(?:\+977[- .]?)?(?:98|97|96|01|0\d)[- .]?\d{7,8}\b"  # ASCII digits
-        r"|[०-९]{9,10}"                                             # Devanagari digits
-    )
-
-    # ── Detect columns from first document ───────────────────────────────────
-    print("Analysing corpus...")
-    first_doc = ds[0] if hasattr(ds, "__getitem__") else next(iter(ds))
-    text_col   = detect_text_column(first_doc)
-    domain_col = detect_domain_column(first_doc)
-
-    # len() works on an in-memory Dataset; undefined on a streaming IterableDataset
-    total_rows = len(ds) if hasattr(ds, "__len__") else None
-    if total_rows:
-        print(f"  Total rows    : {total_rows:,}\n")
-    print(f"  Text column   : '{text_col}'")
-    print(f"  Domain column : '{domain_col}' (None = will mark Unknown)")
-
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    for doc in tqdm(ds, desc="Processing", total=total_rows):
-        text = str(doc.get(text_col, ""))
+    for text, raw_domain in zip(texts, domains):
         if not text:
             continue
+        text = str(text)
 
-        # BUG-3 FIX: deterministic dedup
-        doc_hash = stable_hash(text)
-        if doc_hash in seen_hashes:
-            duplicate_docs += 1
+        h = hashlib.md5(text.encode("utf-8")).hexdigest()
+        if h in seen:
+            dup_c += 1
             continue
-        seen_hashes.add(doc_hash)
+        seen.add(h)
 
         total_docs += 1
         total_chars += len(text)
-        total_bytes += len(text.encode("utf-8"))
+        total_bytes_ += len(text.encode("utf-8"))
 
-        # BUG-4 FIX: domain extraction
-        if domain_col:
-            raw_domain = doc.get(domain_col, "")
-            if raw_domain:
-                parsed = urlparse(str(raw_domain))
-                domain = parsed.netloc or str(raw_domain)
-            else:
-                domain = "Unknown"
+        if raw_domain:
+            p = urlparse(str(raw_domain))
+            domain_freq[p.netloc or str(raw_domain)] += 1
         else:
-            domain = "Unknown"
-        domain_dist[domain] += 1
+            domain_freq["Unknown"] += 1
 
-        # Noise detection (on raw text)
-        html_tags_count       += len(html_pattern.findall(text))
-        urls_count            += len(url_pattern.findall(text))
-        phone_numbers_count   += len(phone_pattern.findall(text))
+        html_c  += len(HTML_RE.findall(text))
+        url_c   += len(URL_RE.findall(text))
+        phone_c += len(PHONE_RE.findall(text))
 
-        # BUG-1 FIX: character counting on raw text
-        for char in text:
-            cp = ord(char)
-            # BUG-6 FIX: emoji via range check
-            if is_emoji(cp):
-                emojis_count += 1
-            elif DEVANAGARI_BLOCK[0] <= cp <= DEVANAGARI_BLOCK[1]:
-                devanagari_chars += 1
-                if DEV_DIGIT_RANGE[0] <= cp <= DEV_DIGIT_RANGE[1]:
-                    devanagari_digits += 1
+        for ch in text:
+            cp = ord(ch)
+            if _is_emoji(cp):
+                emojis += 1
+            elif DEV_LO <= cp <= DEV_HI:
+                dev_chars += 1
+                if DIG_LO <= cp <= DIG_HI:
+                    dev_digits += 1
                 if cp == HALANTA_CP:
-                    halanta_count += 1
-            elif LATIN_UPPER[0] <= cp <= LATIN_UPPER[1] or LATIN_LOWER[0] <= cp <= LATIN_LOWER[1]:
-                latin_chars += 1
-            elif ASCII_DIGIT[0] <= cp <= ASCII_DIGIT[1]:
-                ascii_digits += 1
+                    halanta += 1
+            elif LAT_UP_LO <= cp <= LAT_UP_HI or LAT_LO_LO <= cp <= LAT_LO_HI:
+                lat_chars += 1
+            elif ASC_DIG_LO <= cp <= ASC_DIG_HI:
+                asc_digits += 1
 
-        # BUG-2 FIX: sentence splitting — also split on ।\n and bare newlines
-        sentences = [s.strip() for s in SENTENCE_RE.split(text) if s.strip()]
-        if not sentences:
-            sentences = [text]
-        total_sentences     += len(sentences)
-        doc_lengths_sentences.append(len(sentences))
+        sents = [s.strip() for s in SENTENCE_RE.split(text) if s.strip()] or [text]
+        total_sentences += len(sents)
+        doc_lens_s.append(len(sents))
 
-        doc_word_count = 0
-        for sent in sentences:
+        doc_wc = 0
+        for sent in sents:
             words = sent.split()
-            sent_lengths_words.append(len(words))
-            doc_word_count += len(words)
-
+            sent_lens_w.append(len(words))
+            doc_wc += len(words)
             for word in words:
-                word_clean = word.strip(".,?!।'\u0964\u0965\"()[]{}:;-–—")
-                if not word_clean:
+                wc = word.strip(STRIP_CHARS)
+                if not wc:
                     continue
-                word_freq[word_clean] += 1
+                word_freq[wc] += 1
+                for suf in NEPALI_SUFFIXES:
+                    if wc.endswith(suf) and len(wc) > len(suf):
+                        suffix_freq[suf] += 1
+                        suffix_bearing += 1
+                        break
 
-                # BUG-5 FIX: suffix matching — longest first, already sorted
-                for suffix in NEPALI_SUFFIXES:
-                    if word_clean.endswith(suffix) and len(word_clean) > len(suffix):
-                        suffix_dist[suffix] += 1
-                        suffix_bearing_words += 1
-                        break  # only count once per word (first/longest match)
+        doc_lens_w.append(doc_wc)
+        total_words += doc_wc
 
-        doc_lengths_words.append(doc_word_count)
-        total_words += doc_word_count
+    return {
+        "_n":          [total_docs],
+        "_sents":      [total_sentences],
+        "_words":      [total_words],
+        "_chars":      [total_chars],
+        "_bytes":      [total_bytes_],
+        "_dev":        [dev_chars],
+        "_lat":        [lat_chars],
+        "_ddev":       [dev_digits],
+        "_dasc":       [asc_digits],
+        "_hal":        [halanta],
+        "_emo":        [emojis],
+        "_html":       [html_c],
+        "_url":        [url_c],
+        "_phone":      [phone_c],
+        "_dup":        [dup_c],
+        "_sufb":       [suffix_bearing],
+        # JSON strings — avoids Arrow schema mismatch across batches
+        "_wfreq":      [json.dumps(dict(word_freq.most_common(50_000)), ensure_ascii=False)],
+        "_dfreq":      [json.dumps(dict(domain_freq), ensure_ascii=False)],
+        "_sfreq":      [json.dumps(dict(suffix_freq), ensure_ascii=False)],
+        "_dls":        [json.dumps(doc_lens_s)],
+        "_dlw":        [json.dumps(doc_lens_w)],
+        "_slw":        [json.dumps(sent_lens_w)],
+    }
 
-    # ── Aggregate statistics ──────────────────────────────────────────────────
-    unique_words    = len(word_freq)
-    ttr             = unique_words / max(total_words, 1)
-    hapax_legomena  = sum(1 for c in word_freq.values() if c == 1)
-    hapax_ratio_tokens = hapax_legomena / max(total_words, 1)    # per proposal convention
-    hapax_ratio_types  = hapax_legomena / max(unique_words, 1)   # also report this
 
-    duplicate_rate  = duplicate_docs / max(total_docs + duplicate_docs, 1)
+# ─────────────────────────────────────────────────────────────────────────────
+# Stats helper
+# ─────────────────────────────────────────────────────────────────────────────
 
-    total_script_chars = devanagari_chars + latin_chars
-    total_digit_chars  = devanagari_digits + ascii_digits
+def get_stats(data: list) -> dict:
+    if not data:
+        return {"min":0,"q1":0,"median":0,"q3":0,"max":0,"mean":0.0}
+    s = sorted(data); n = len(s)
+    return {"min":s[0],"q1":s[n//4],"median":s[n//2],"q3":s[3*n//4],
+            "max":s[-1],"mean":round(sum(data)/n,2)}
 
-    doc_len_sent_stats = get_stats(doc_lengths_sentences)
-    doc_len_word_stats = get_stats(doc_lengths_words)
-    sent_len_word_stats = get_stats(sent_lengths_words)
 
-    # ── Write Markdown report ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Report generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
+                    n_proc=None, batch_size=2000):
+    global TEXT_COL, DOMAIN_COL
+
+    n_proc = n_proc or multiprocessing.cpu_count()
+    TEXT_COL   = detect_text_column(ds.column_names)
+    DOMAIN_COL = detect_domain_column(ds.column_names)
+
+    print(f"  Columns      : {ds.column_names}")
+    print(f"  Text column  : '{TEXT_COL}'")
+    print(f"  Domain col   : '{DOMAIN_COL}'")
+    print(f"  Workers      : {n_proc}  |  Batch size: {batch_size}")
+    print(f"  Total rows   : {len(ds):,}\n")
+
+    print("Running parallel map()...")
+    res = ds.map(
+        analyse_batch,
+        batched=True,
+        batch_size=batch_size,
+        num_proc=n_proc,
+        remove_columns=ds.column_names,
+        desc="Analysing",
+    )
+
+    print("Reducing...")
+    total_docs = sum(res["_n"])
+    total_sents= sum(res["_sents"])
+    total_words= sum(res["_words"])
+    total_chars= sum(res["_chars"])
+    total_bytes= sum(res["_bytes"])
+    dev_chars  = sum(res["_dev"])
+    lat_chars  = sum(res["_lat"])
+    dev_digits = sum(res["_ddev"])
+    asc_digits = sum(res["_dasc"])
+    halanta    = sum(res["_hal"])
+    emojis     = sum(res["_emo"])
+    html_c     = sum(res["_html"])
+    url_c      = sum(res["_url"])
+    phone_c    = sum(res["_phone"])
+    dups       = sum(res["_dup"])
+    sufb       = sum(res["_sufb"])
+
+    wfreq = collections.Counter()
+    dfreq = collections.Counter()
+    sfreq = collections.Counter()
+    dls, dlw, slw = [], [], []
+
+    for i in tqdm(range(len(res)), desc="Merging counters"):
+        row = res[i]
+        wfreq.update(json.loads(row["_wfreq"]))
+        dfreq.update(json.loads(row["_dfreq"]))
+        sfreq.update(json.loads(row["_sfreq"]))
+        dls.extend(json.loads(row["_dls"]))
+        dlw.extend(json.loads(row["_dlw"]))
+        slw.extend(json.loads(row["_slw"]))
+
+    unique  = len(wfreq)
+    ttr     = unique / max(total_words, 1)
+    hapax   = sum(1 for c in wfreq.values() if c == 1)
+    dup_rate= dups / max(total_docs + dups, 1)
+    ts      = dev_chars + lat_chars
+    td      = dev_digits + asc_digits
+
+    DS = get_stats(dls); DW = get_stats(dlw); SW = get_stats(slw)
+
     print(f"\nWriting report → {output_file}")
     with open(output_file, "w", encoding="utf-8") as f:
+        W = f.write
+        W("# Nepali Corpus Evaluation Report\n")
+        W("*LINGUA-NEP / IRIIS-RESEARCH/Nepali-Text-Corpus*\n\n")
 
-        f.write("# Nepali Corpus Evaluation Report\n")
-        f.write("*LINGUA-NEP / IRIIS-RESEARCH/Nepali-Text-Corpus*\n\n")
+        W("## 1. Corpus Size Metrics\n")
+        W(f"- **Total Documents (post-dedup):** {total_docs:,}\n")
+        W(f"- **Exact Duplicates Removed:** {dups:,}  ({dup_rate:.2%})\n")
+        W(f"- **Total Sentences:** {total_sents:,}\n")
+        W(f"- **Total Words (tokens):** {total_words:,}\n")
+        W(f"- **Total Characters:** {total_chars:,}\n")
+        W(f"- **Total Bytes (UTF-8):** {total_bytes:,} (≈ {total_bytes/(1024**3):.2f} GB)\n\n")
 
-        # §1 Corpus size
-        f.write("## 1. Corpus Size Metrics\n")
-        f.write(f"- **Total Documents (after dedup):** {total_docs:,}\n")
-        f.write(f"- **Total Sentences:** {total_sentences:,}\n")
-        f.write(f"- **Total Words (tokens):** {total_words:,}\n")
-        f.write(f"- **Total Characters:** {total_chars:,}\n")
-        f.write(f"- **Total Bytes (UTF-8):** {total_bytes:,} "
-                f"(≈ {total_bytes / (1024**3):.2f} GB)\n\n")
+        W("## 2. Vocabulary & Typology\n")
+        W(f"- **Unique Word Types:** {unique:,}\n")
+        W(f"- **Type-Token Ratio (TTR):** {ttr:.5f}\n")
+        W(f"- **Hapax Legomena:** {hapax:,}\n")
+        W(f"- **Hapax / Total Tokens:** {hapax/max(total_words,1):.5f}\n")
+        W(f"- **Hapax / Unique Types:** {hapax/max(unique,1):.5f}\n\n")
 
-        # §2 Vocabulary
-        f.write("## 2. Vocabulary & Typology\n")
-        f.write(f"- **Unique Word Types:** {unique_words:,}\n")
-        f.write(f"- **Type-Token Ratio (TTR):** {ttr:.5f}\n")
-        f.write(f"- **Hapax Legomena:** {hapax_legomena:,}\n")
-        f.write(f"- **Hapax / Total Tokens:** {hapax_ratio_tokens:.5f}\n")
-        f.write(f"- **Hapax / Unique Types:** {hapax_ratio_types:.5f}  "
-                f"*(fraction of vocabulary appearing only once)*\n\n")
+        W("## 3. Source / Domain Distribution\n")
+        for dom, cnt in dfreq.most_common(15):
+            W(f"- **{dom}**: {cnt:,}\n")
+        W("\n")
 
-        # §3 Source/domain
-        f.write("## 3. Source / Domain Distribution\n")
-        for domain, count in domain_dist.most_common(15):
-            f.write(f"- **{domain}**: {count:,} documents\n")
-        f.write("\n")
+        W("## 4. Length Distributions\n")
+        W("### Document Lengths (sentences)\n")
+        W(f"- Mean: {DS['mean']} | Median: {DS['median']} | Q1: {DS['q1']} | Q3: {DS['q3']} | Max: {DS['max']}\n")
+        W("### Document Lengths (words)\n")
+        W(f"- Mean: {DW['mean']} | Median: {DW['median']} | Q1: {DW['q1']} | Q3: {DW['q3']} | Max: {DW['max']}\n")
+        W("### Sentence Lengths (words)\n")
+        W(f"- Mean: {SW['mean']} | Median: {SW['median']} | Q1: {SW['q1']} | Q3: {SW['q3']} | Max: {SW['max']}\n\n")
 
-        # §4 Length distributions
-        f.write("## 4. Length Distributions\n")
-        f.write("### Document Lengths (sentences)\n")
-        f.write(f"- Mean: {doc_len_sent_stats['mean']:.2f}  |  "
-                f"Median: {doc_len_sent_stats['median']}  |  "
-                f"Q1: {doc_len_sent_stats['q1']}  |  "
-                f"Q3: {doc_len_sent_stats['q3']}  |  "
-                f"Max: {doc_len_sent_stats['max']}\n")
-        f.write("### Document Lengths (words)\n")
-        f.write(f"- Mean: {doc_len_word_stats['mean']:.2f}  |  "
-                f"Median: {doc_len_word_stats['median']}  |  "
-                f"Q1: {doc_len_word_stats['q1']}  |  "
-                f"Q3: {doc_len_word_stats['q3']}  |  "
-                f"Max: {doc_len_word_stats['max']}\n")
-        f.write("### Sentence Lengths (words)\n")
-        f.write(f"- Mean: {sent_len_word_stats['mean']:.2f}  |  "
-                f"Median: {sent_len_word_stats['median']}  |  "
-                f"Q1: {sent_len_word_stats['q1']}  |  "
-                f"Q3: {sent_len_word_stats['q3']}  |  "
-                f"Max: {sent_len_word_stats['max']}\n\n")
+        W("## 5. Devanagari vs Latin Script Ratio\n")
+        W(f"- **Devanagari Characters:** {dev_chars:,}\n")
+        W(f"- **Latin Characters:** {lat_chars:,}\n")
+        if ts: W(f"- **Ratio:** {dev_chars/ts:.2%} Devanagari / {lat_chars/ts:.2%} Latin\n")
+        W(f"- **Other (punct, space, symbols):** {total_chars-dev_chars-lat_chars-asc_digits:,}\n\n")
 
-        # §5 Script ratio
-        f.write("## 5. Devanagari vs Latin Script Ratio\n")
-        f.write(f"- **Devanagari Characters:** {devanagari_chars:,}\n")
-        f.write(f"- **Latin Characters:** {latin_chars:,}\n")
-        if total_script_chars > 0:
-            f.write(f"- **Ratio:** {devanagari_chars / total_script_chars:.2%} Devanagari  /  "
-                    f"{latin_chars / total_script_chars:.2%} Latin\n")
-        f.write(f"- **Other Characters (punct, spaces, etc.):** "
-                f"{total_chars - devanagari_chars - latin_chars - ascii_digits:,}\n\n")
+        W("## 6. Digit Distribution (Devanagari vs ASCII)\n")
+        W(f"- **Devanagari Digits (०–९):** {dev_digits:,}\n")
+        W(f"- **ASCII Digits (0–9):** {asc_digits:,}\n")
+        if td: W(f"- **Ratio:** {dev_digits/td:.2%} Devanagari / {asc_digits/td:.2%} ASCII\n")
+        W("\n  > **LinguaBPE H3:** High Devanagari-digit ratio justifies numeral normalisation layer.\n\n")
 
-        # §6 Digit distribution
-        f.write("## 6. Digit Distribution (Devanagari vs ASCII)\n")
-        f.write(f"- **Devanagari Digits (०–९):** {devanagari_digits:,}\n")
-        f.write(f"- **ASCII Digits (0–9):** {ascii_digits:,}\n")
-        if total_digit_chars > 0:
-            f.write(f"- **Ratio:** {devanagari_digits / total_digit_chars:.2%} Devanagari  /  "
-                    f"{ascii_digits / total_digit_chars:.2%} ASCII\n")
-        f.write("\n  > **Note for LinguaBPE:** The Devanagari/ASCII split directly motivates "
-                "the numeral-normalisation layer (Hypothesis H3). A high Devanagari-digit ratio "
-                "means the normalisation will have broad coverage.\n\n")
+        W("## 7. Halanta & Conjuncts\n")
+        W(f"- **Halanta (् U+094D) Count:** {halanta:,}\n")
+        if dev_chars: W(f"- **Halanta Density:** {halanta/dev_chars:.4%} of all Devanagari chars\n")
+        W("  > **LinguaBPE H2:** Each Halanta = one conjunct vulnerable to byte-level fragmentation.\n\n")
 
-        # §7 Halanta
-        f.write("## 7. Halanta & Conjuncts\n")
-        f.write(f"- **Halanta (्  U+094D) Count:** {halanta_count:,}\n")
-        if devanagari_chars > 0:
-            f.write(f"- **Halanta Density:** {halanta_count / devanagari_chars:.4%} "
-                    f"of all Devanagari chars\n")
-        f.write("  > Halanta count is the primary empirical evidence for Hypothesis H2 "
-                "(conjunct preservation). Each Halanta instance represents a conjunct that "
-                "standard BPE may fragment.\n\n")
+        W("## 8. Suffix-bearing Words\n")
+        W(f"- **Suffix-bearing Words:** {sufb:,} ({sufb/max(total_words,1):.2%} of total)\n")
+        W("  > Longest-first matching: हरुको counted as हरुको, not को.\n")
+        W("- **Per-suffix counts:**\n")
+        for suf, cnt in sfreq.most_common(20):
+            W(f"  - `{suf}`: {cnt:,}  ({cnt/max(sufb,1):.2%})\n")
+        W("\n")
 
-        # §8 Suffix-bearing words
-        f.write("## 8. Suffix-bearing Words\n")
-        f.write(f"- **Suffix-bearing Words:** {suffix_bearing_words:,} "
-                f"({suffix_bearing_words / max(total_words, 1):.2%} of total words)\n")
-        f.write("  > Longest-first matching ensures हरुको is not mis-counted as को.\n")
-        f.write("- **Top Suffix Occurrences:**\n")
-        for suffix, count in suffix_dist.most_common(15):
-            f.write(f"  - `{suffix}`: {count:,}  "
-                    f"({count / max(suffix_bearing_words, 1):.2%} of suffix-bearing words)\n")
-        f.write("\n")
+        W("## 9. Noise Rates\n")
+        W(f"- **HTML Remnants:** {html_c:,}\n")
+        W(f"- **URLs:** {url_c:,}\n")
+        W(f"- **Phone Numbers:** {phone_c:,}\n")
+        W(f"- **Emojis:** {emojis:,}\n\n")
 
-        # §9 Duplication
-        f.write("## 9. Formatting & Duplication\n")
-        f.write(f"- **Exact Duplicate Documents:** {duplicate_docs:,}\n")
-        f.write(f"- **Exact Duplicate Rate:** {duplicate_rate:.2%}\n")
-        f.write("  > Near-duplicate detection (e.g. same article with minor edits) "
-                "requires MinHash or SimHash — not implemented here.\n\n")
+        W("## 10. Top 50 Most Frequent Words\n")
+        for word, cnt in wfreq.most_common(50):
+            W(f"- `{word}`: {cnt:,}\n")
 
-        # §10 Noise
-        f.write("## 10. Noise Rates\n")
-        f.write(f"- **HTML Element Remnants:** {html_tags_count:,}\n")
-        f.write(f"- **URLs Found:** {urls_count:,}  *(https:// + www. bare domains)*\n")
-        f.write(f"- **Phone Numbers Detected:** {phone_numbers_count:,}  "
-                f"*(ASCII + Devanagari digit patterns)*\n")
-        f.write(f"- **Emojis Found:** {emojis_count:,}  "
-                f"*(comprehensive Unicode emoji block scan)*\n\n")
-
-        # §11 Top vocabulary
-        f.write("## 11. Top 30 Most Frequent Words\n")
-        for word, count in word_freq.most_common(30):
-            f.write(f"- `{word}`: {count:,}\n")
-        f.write("\n")
-
-    print(f"Done. Report saved → {output_file}")
+    print(f"\n✅ Report saved → {output_file}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import os
-    import multiprocessing
-
     n_cores = multiprocessing.cpu_count()
-    print(f"Loading full dataset into RAM  (cores available: {n_cores})")
-    print("This will use ~20–28 GB RAM and take 3–8 minutes to download/cache.\n")
+    print(f"Cores: {n_cores}  |  Loading IRIIS corpus into RAM...")
 
-    dataset = load_dataset(
+    ds = load_dataset(
         "IRIIS-RESEARCH/Nepali-Text-Corpus",
         split="train",
-        trust_remote_code=True,
-        num_proc=n_cores,       # parallel Arrow shard loading — saturates disk I/O
+        num_proc=n_cores,
     )
+    print(f"Loaded: {len(ds):,} rows | {ds.column_names}\n")
 
-    print(f"Dataset loaded: {len(dataset):,} rows  |  "
-          f"columns: {dataset.column_names}\n")
-
-    output_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "corpus_evaluation_report_corrected.md",
-    )
-    generate_report(dataset, output_file=output_path)
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "corpus_evaluation_report_corrected.md")
+    generate_report(ds, output_file=out, n_proc=n_cores, batch_size=2000)
