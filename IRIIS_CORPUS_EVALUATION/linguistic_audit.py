@@ -102,7 +102,7 @@ DEV_SPAN_RE  = re.compile(r"[०-९]+")
 ASCII_SPAN_RE = re.compile(r"[0-9]+")
 
 # Phone: 9-10 consecutive Devanagari or ASCII digits (Nepali mobile format)
-PHONE_DEV_RE = re.compile(r"(?<![०-९])[९८७][०-९]{8,9}(?![०-९])")
+PHONE_DEV_RE = re.compile(r"(?<![०-९])[९८][०-९]{8,9}(?![०-९])")
 PHONE_ASC_RE = re.compile(r"(?<![0-9])(?:98|97|96|01)[0-9]{7,8}(?![0-9])")
 
 # Dates: various Nepali date formats

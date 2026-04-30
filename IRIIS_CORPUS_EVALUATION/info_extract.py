@@ -22,6 +22,7 @@ import json
 import collections
 import multiprocessing
 from urllib.parse import urlparse
+import numpy as np
 
 from datasets import load_dataset
 from tqdm import tqdm
@@ -41,6 +42,8 @@ NEPALI_SUFFIXES = sorted(
     key=len, reverse=True,
 )
 
+sentence_re = re.compile(r"[।\.!\?]+\s*|\n+")
+
 SENTENCE_RE = re.compile(r"[।\.!\?]+\s*|\n+")
 HTML_RE     = re.compile(r"<[^>]{1,200}?>")
 URL_RE      = re.compile(r"https?://\S+|www\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}\S*")
@@ -49,12 +52,12 @@ PHONE_RE    = re.compile(
 )
 STRIP_CHARS = ".,?!\u0964\u0965'\"()[]{}:;-\u2013\u2014"
 
-DEV_LO, DEV_HI         = 0x0900, 0x097F
-DIG_LO, DIG_HI         = 0x0966, 0x096F
-HALANTA_CP              = 0x094D
-LAT_UP_LO, LAT_UP_HI   = 0x0041, 0x005A
-LAT_LO_LO, LAT_LO_HI   = 0x0061, 0x007A
-ASC_DIG_LO, ASC_DIG_HI = 0x0030, 0x0039
+DEV_LO, DEV_HI         = 0x0900, 0x097F #devanagari word range bounds
+DIG_LO, DIG_HI         = 0x0966, 0x096F #devanagari digits ०-९
+HALANTA_CP              = 0x094D        #halanta (virama) char used in conjuncts
+LAT_UP_LO, LAT_UP_HI   = 0x0041, 0x005A #a-zA-Z Latin chars
+LAT_LO_LO, LAT_LO_HI   = 0x0061, 0x007A # lowercase a-z
+ASC_DIG_LO, ASC_DIG_HI = 0x0030, 0x0039 # ASCII digits 0-9
 
 EMOJI_RANGES = [
     (0x1F300,0x1F5FF),(0x1F600,0x1F64F),(0x1F650,0x1F67F),(0x1F680,0x1F6FF),
@@ -73,38 +76,11 @@ EMOJI_RANGES = [
     (0xFE00,0xFE0F),(0x1F1E0,0x1F1FF),
 ]
 
+# returns True if cp lies inside EMOJI_RANGES defined above
 def _is_emoji(cp: int) -> bool:
     return any(lo <= cp <= hi for lo, hi in EMOJI_RANGES)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Column detection
-# ─────────────────────────────────────────────────────────────────────────────
-
-def detect_text_column(columns: list) -> str:
-    lower = {c.lower(): c for c in columns}
-    for cand in ["text", "content", "article", "body", "paragraph", "sentence"]:
-        if cand in lower:
-            return lower[cand]
-    for c in columns:
-        if c.lower() not in {"id", "index", "url", "source", "domain"}:
-            return c
-    return columns[0]
-
-def detect_domain_column(columns: list):
-    lower = {c.lower(): c for c in columns}
-    for cand in ["url", "domain", "source", "website", "origin", "site"]:
-        if cand in lower:
-            return lower[cand]
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Batch worker — called by datasets.map() in each subprocess
-# ─────────────────────────────────────────────────────────────────────────────
-# TEXT_COL / DOMAIN_COL are set as module globals before map() is called
-# (avoids lambda / closure pickling issues on some platforms)
-
+# dataset structure and column names 
 TEXT_COL   = "Article"
 DOMAIN_COL = "Source"
 
@@ -220,31 +196,50 @@ def analyse_batch(batch: dict) -> dict:
 def get_stats(data: list) -> dict:
     if not data:
         return {"min":0,"q1":0,"median":0,"q3":0,"max":0,"mean":0.0}
-    s = sorted(data); n = len(s)
-    return {"min":s[0],"q1":s[n//4],"median":s[n//2],"q3":s[3*n//4],
-            "max":s[-1],"mean":round(sum(data)/n,2)}
+    s = np.array(sorted(data))
+    n = len(s)
+
+    q1, median, q3 = np.percentile(s, [25, 50, 75])
+
+    return {
+        "min": int(s[0]),
+        "q1": float(round(float(q1), 2)),
+        "median": float(round(float(median), 2)),
+        "q3": float(round(float(q3), 2)),
+        "max": int(s[-1]),
+        "mean": round(sum(data)/n, 2),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Report generator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
-                    n_proc=None, batch_size=2000):
-    global TEXT_COL, DOMAIN_COL
+def _print_report_header(ds, n_proc, batch_size):
+    """Print a short runtime header showing dataset and worker settings.
 
-    n_proc = n_proc or multiprocessing.cpu_count()
-    TEXT_COL   = detect_text_column(ds.column_names)
-    DOMAIN_COL = detect_domain_column(ds.column_names)
-
+    Args:
+        ds: HuggingFace Dataset object.
+        n_proc: Number of worker processes used for mapping.
+        batch_size: Number of rows per batch passed to the mapper.
+    """
     print(f"  Columns      : {ds.column_names}")
     print(f"  Text column  : '{TEXT_COL}'")
     print(f"  Domain col   : '{DOMAIN_COL}'")
     print(f"  Workers      : {n_proc}  |  Batch size: {batch_size}")
     print(f"  Total rows   : {len(ds):,}\n")
 
+
+def _run_map(ds, n_proc, batch_size):
+    """Run `ds.map()` with `analyse_batch` in parallel and return the result.
+
+    Important options:
+    - `batched=True` so the mapper receives lists (batches) instead of single rows.
+    - `remove_columns` drops original text columns from the returned Dataset to keep
+      the per-batch result compact.
+    """
     print("Running parallel map()...")
-    res = ds.map(
+    return ds.map(
         analyse_batch,
         batched=True,
         batch_size=batch_size,
@@ -253,47 +248,67 @@ def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
         desc="Analysing",
     )
 
-    print("Reducing...")
-    total_docs = sum(res["_n"])
-    total_sents= sum(res["_sents"])
-    total_words= sum(res["_words"])
-    total_chars= sum(res["_chars"])
-    total_bytes= sum(res["_bytes"])
-    dev_chars  = sum(res["_dev"])
-    lat_chars  = sum(res["_lat"])
-    dev_digits = sum(res["_ddev"])
-    asc_digits = sum(res["_dasc"])
-    halanta    = sum(res["_hal"])
-    emojis     = sum(res["_emo"])
-    html_c     = sum(res["_html"])
-    url_c      = sum(res["_url"])
-    phone_c    = sum(res["_phone"])
-    dups       = sum(res["_dup"])
-    sufb       = sum(res["_sufb"])
 
+def _reduce_results(res):
+    """Aggregate per-batch results in `res` into corpus-level statistics.
+
+    Returns a tuple: (stats_dict, word_counter, domain_counter, suffix_counter,
+    doc_sent_stats, doc_word_stats, sent_word_stats)
+    """
+    print("Reducing...")
+
+    # Sum scalar counters across batches (each res["_..."] is a list of per-batch values)
+    stats = {}
+    stats["total_docs"] = sum(res["_n"])
+    stats["total_sents"] = sum(res["_sents"])
+    stats["total_words"] = sum(res["_words"])
+    stats["total_chars"] = sum(res["_chars"])
+    stats["total_bytes"] = sum(res["_bytes"])
+    stats["dev_chars"] = sum(res["_dev"])
+    stats["lat_chars"] = sum(res["_lat"])
+    stats["dev_digits"] = sum(res["_ddev"])
+    stats["asc_digits"] = sum(res["_dasc"])
+    stats["halanta"] = sum(res["_hal"])
+    stats["emojis"] = sum(res["_emo"])
+    stats["html_c"] = sum(res["_html"])
+    stats["url_c"] = sum(res["_url"])
+    stats["phone_c"] = sum(res["_phone"])
+    stats["dups"] = sum(res["_dup"])
+    stats["sufb"] = sum(res["_sufb"])
+
+    # Initialize accumulators for counters and distributions
     wfreq = collections.Counter()
     dfreq = collections.Counter()
     sfreq = collections.Counter()
     dls, dlw, slw = [], [], []
 
+    # Merge JSON-serialized counters returned by each batch into global counters/lists
     for i in tqdm(range(len(res)), desc="Merging counters"):
         row = res[i]
+        # `_wfreq` / `_dfreq` / `_sfreq` are JSON strings mapping item->count
         wfreq.update(json.loads(row["_wfreq"]))
         dfreq.update(json.loads(row["_dfreq"]))
         sfreq.update(json.loads(row["_sfreq"]))
+        # `_dls`, `_dlw`, `_slw` are JSON lists of lengths — extend the master lists
         dls.extend(json.loads(row["_dls"]))
         dlw.extend(json.loads(row["_dlw"]))
         slw.extend(json.loads(row["_slw"]))
 
-    unique  = len(wfreq)
-    ttr     = unique / max(total_words, 1)
-    hapax   = sum(1 for c in wfreq.values() if c == 1)
-    dup_rate= dups / max(total_docs + dups, 1)
-    ts      = dev_chars + lat_chars
-    td      = dev_digits + asc_digits
+    # Derived statistics
+    stats["unique"] = len(wfreq)
+    stats["ttr"] = stats["unique"] / max(stats["total_words"], 1)
+    stats["hapax"] = sum(1 for c in wfreq.values() if c == 1)
+    stats["dup_rate"] = stats["dups"] / max(stats["total_docs"] + stats["dups"], 1)
+    stats["ts"] = stats["dev_chars"] + stats["lat_chars"]
+    stats["td"] = stats["dev_digits"] + stats["asc_digits"]
 
+    # Compute distribution summaries for document/sentence lengths
     DS = get_stats(dls); DW = get_stats(dlw); SW = get_stats(slw)
 
+    return stats, wfreq, dfreq, sfreq, DS, DW, SW
+
+
+def _write_report(output_file, stats, wfreq, dfreq, sfreq, DS, DW, SW):
     print(f"\nWriting report → {output_file}")
     with open(output_file, "w", encoding="utf-8") as f:
         W = f.write
@@ -301,19 +316,19 @@ def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
         W("*LINGUA-NEP / IRIIS-RESEARCH/Nepali-Text-Corpus*\n\n")
 
         W("## 1. Corpus Size Metrics\n")
-        W(f"- **Total Documents (post-dedup):** {total_docs:,}\n")
-        W(f"- **Exact Duplicates Removed:** {dups:,}  ({dup_rate:.2%})\n")
-        W(f"- **Total Sentences:** {total_sents:,}\n")
-        W(f"- **Total Words (tokens):** {total_words:,}\n")
-        W(f"- **Total Characters:** {total_chars:,}\n")
-        W(f"- **Total Bytes (UTF-8):** {total_bytes:,} (≈ {total_bytes/(1024**3):.2f} GB)\n\n")
+        W(f"- **Total Documents (post-dedup):** {stats['total_docs']:,}\n")
+        W(f"- **Exact Duplicates Removed:** {stats['dups']:,}  ({stats['dup_rate']:.2%})\n")
+        W(f"- **Total Sentences:** {stats['total_sents']:,}\n")
+        W(f"- **Total Words (tokens):** {stats['total_words']:,}\n")
+        W(f"- **Total Characters:** {stats['total_chars']:,}\n")
+        W(f"- **Total Bytes (UTF-8):** {stats['total_bytes']:,} (≈ {stats['total_bytes']/(1024**3):.2f} GB)\n\n")
 
         W("## 2. Vocabulary & Typology\n")
-        W(f"- **Unique Word Types:** {unique:,}\n")
-        W(f"- **Type-Token Ratio (TTR):** {ttr:.5f}\n")
-        W(f"- **Hapax Legomena:** {hapax:,}\n")
-        W(f"- **Hapax / Total Tokens:** {hapax/max(total_words,1):.5f}\n")
-        W(f"- **Hapax / Unique Types:** {hapax/max(unique,1):.5f}\n\n")
+        W(f"- **Unique Word Types:** {stats['unique']:,}\n")
+        W(f"- **Type-Token Ratio (TTR):** {stats['ttr']:.5f}\n")
+        W(f"- **Hapax Legomena:** {stats['hapax']:,}\n")
+        W(f"- **Hapax / Total Tokens:** {stats['hapax']/max(stats['total_words'],1):.5f}\n")
+        W(f"- **Hapax / Unique Types:** {stats['hapax']/max(stats['unique'],1):.5f}\n\n")
 
         W("## 3. Source / Domain Distribution\n")
         for dom, cnt in dfreq.most_common(15):
@@ -329,35 +344,35 @@ def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
         W(f"- Mean: {SW['mean']} | Median: {SW['median']} | Q1: {SW['q1']} | Q3: {SW['q3']} | Max: {SW['max']}\n\n")
 
         W("## 5. Devanagari vs Latin Script Ratio\n")
-        W(f"- **Devanagari Characters:** {dev_chars:,}\n")
-        W(f"- **Latin Characters:** {lat_chars:,}\n")
-        if ts: W(f"- **Ratio:** {dev_chars/ts:.2%} Devanagari / {lat_chars/ts:.2%} Latin\n")
-        W(f"- **Other (punct, space, symbols):** {total_chars-dev_chars-lat_chars-asc_digits:,}\n\n")
+        W(f"- **Devanagari Characters:** {stats['dev_chars']:,}\n")
+        W(f"- **Latin Characters:** {stats['lat_chars']:,}\n")
+        if stats['ts']: W(f"- **Ratio:** {stats['dev_chars']/stats['ts']:.2%} Devanagari / {stats['lat_chars']/stats['ts']:.2%} Latin\n")
+        W(f"- **Other (punct, space, symbols):** {stats['total_chars']-stats['dev_chars']-stats['lat_chars']-stats['asc_digits']:,}\n\n")
 
         W("## 6. Digit Distribution (Devanagari vs ASCII)\n")
-        W(f"- **Devanagari Digits (०–९):** {dev_digits:,}\n")
-        W(f"- **ASCII Digits (0–9):** {asc_digits:,}\n")
-        if td: W(f"- **Ratio:** {dev_digits/td:.2%} Devanagari / {asc_digits/td:.2%} ASCII\n")
+        W(f"- **Devanagari Digits (०–९):** {stats['dev_digits']:,}\n")
+        W(f"- **ASCII Digits (0–9):** {stats['asc_digits']:,}\n")
+        if stats['td']: W(f"- **Ratio:** {stats['dev_digits']/stats['td']:.2%} Devanagari / {stats['asc_digits']/stats['td']:.2%} ASCII\n")
         W("\n  > **LinguaBPE H3:** High Devanagari-digit ratio justifies numeral normalisation layer.\n\n")
 
         W("## 7. Halanta & Conjuncts\n")
-        W(f"- **Halanta (् U+094D) Count:** {halanta:,}\n")
-        if dev_chars: W(f"- **Halanta Density:** {halanta/dev_chars:.4%} of all Devanagari chars\n")
+        W(f"- **Halanta (् U+094D) Count:** {stats['halanta']:,}\n")
+        if stats['dev_chars']: W(f"- **Halanta Density:** {stats['halanta']/stats['dev_chars']:.4%} of all Devanagari chars\n")
         W("  > **LinguaBPE H2:** Each Halanta = one conjunct vulnerable to byte-level fragmentation.\n\n")
 
         W("## 8. Suffix-bearing Words\n")
-        W(f"- **Suffix-bearing Words:** {sufb:,} ({sufb/max(total_words,1):.2%} of total)\n")
+        W(f"- **Suffix-bearing Words:** {stats['sufb']:,} ({stats['sufb']/max(stats['total_words'],1):.2%} of total)\n")
         W("  > Longest-first matching: हरुको counted as हरुको, not को.\n")
         W("- **Per-suffix counts:**\n")
         for suf, cnt in sfreq.most_common(20):
-            W(f"  - `{suf}`: {cnt:,}  ({cnt/max(sufb,1):.2%})\n")
+            W(f"  - `{suf}`: {cnt:,}  ({cnt/max(stats['sufb'],1):.2%})\n")
         W("\n")
 
         W("## 9. Noise Rates\n")
-        W(f"- **HTML Remnants:** {html_c:,}\n")
-        W(f"- **URLs:** {url_c:,}\n")
-        W(f"- **Phone Numbers:** {phone_c:,}\n")
-        W(f"- **Emojis:** {emojis:,}\n\n")
+        W(f"- **HTML Remnants:** {stats['html_c']:,}\n")
+        W(f"- **URLs:** {stats['url_c']:,}\n")
+        W(f"- **Phone Numbers:** {stats['phone_c']:,}\n")
+        W(f"- **Emojis:** {stats['emojis']:,}\n\n")
 
         W("## 10. Top 50 Most Frequent Words\n")
         for word, cnt in wfreq.most_common(50):
@@ -366,18 +381,35 @@ def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
     print(f"\n✅ Report saved → {output_file}")
 
 
+def generate_report(ds, output_file="corpus_evaluation_report_corrected.md",
+                    n_proc=None, batch_size=2000):
+    global TEXT_COL, DOMAIN_COL
+
+    n_proc = n_proc or multiprocessing.cpu_count()
+
+    _print_report_header(ds, n_proc, batch_size)
+
+    res = _run_map(ds, n_proc, batch_size)
+
+    stats, wfreq, dfreq, sfreq, DS, DW, SW = _reduce_results(res)
+
+    _write_report(output_file, stats, wfreq, dfreq, sfreq, DS, DW, SW)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    n_cores = multiprocessing.cpu_count()
+    n_cores = multiprocessing.cpu_count() # count the available CPU cores for parallel processing
     print(f"Cores: {n_cores}  |  Loading IRIIS corpus into RAM...")
 
     ds = load_dataset(
         "IRIIS-RESEARCH/Nepali-Text-Corpus",
         split="train",
-        num_proc=n_cores,
+        num_proc=n_cores, # used for enabling multiprocessing. 
     )
+
     print(f"Loaded: {len(ds):,} rows | {ds.column_names}\n")
 
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "corpus_evaluation_report_corrected.md")
-    generate_report(ds, output_file=out, n_proc=n_cores, batch_size=2000)
+    base_dir = os.path.dirname(os.path.abspath(__file__)) # __file__ is the current script path
+    report_path = os.path.join(base_dir, "corpus_evaluation_reportt.md")
+
+    generate_report(ds, output_file=report_path, n_proc=n_cores, batch_size=2000)
