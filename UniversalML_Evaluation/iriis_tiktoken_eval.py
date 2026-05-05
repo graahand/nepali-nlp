@@ -216,6 +216,21 @@ def resolve_domain_column(columns: list[str], preferred: str | None) -> str | No
     return None
 
 
+def safe_slug(value: str) -> str:
+    if not value:
+        return "tokenizer"
+    slug_chars: list[str] = []
+    for ch in value:
+        if ch.isascii() and (ch.isalnum() or ch in {"-", "_"}):
+            slug_chars.append(ch)
+        else:
+            slug_chars.append("_")
+    slug = "".join(slug_chars).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug or "tokenizer"
+
+
 def strip_suffix_chain(word: str, suffix_list: list[str]) -> tuple[str, list[str]]:
     chain: list[str] = []
     current = word
@@ -303,6 +318,13 @@ def evaluate_sample(args: argparse.Namespace) -> dict:
         "halanta_words": TokenStats(),
         "super_suffix_words": TokenStats(),
         "chain_len_3plus": TokenStats(),
+    }
+
+    word_lists: dict[str, set[str]] = {
+        "suffix_words": set(),
+        "halanta_words": set(),
+        "super_suffix_words": set(),
+        "chain_len_3_plus": set(),
     }
 
     doc_ratios: list[float] = []
@@ -410,16 +432,20 @@ def evaluate_sample(args: argparse.Namespace) -> dict:
             _stem, chain = strip_suffix_chain(word, ALL_SUFFIXES)
             if chain:
                 subset_stats["suffix_words"].add(token_count)
+                word_lists["suffix_words"].add(word)
                 morphological_total += 1
                 if any(is_suffix_fragmented(tokens_clean, suffix) for suffix in chain):
                     morphological_severed += 1
                 if len(chain) >= 3:
                     subset_stats["chain_len_3plus"].add(token_count)
+                    word_lists["chain_len_3_plus"].add(word)
                 if any(word.endswith(suf) for suf in SUPER_SUFFIX_CANDIDATES):
                     subset_stats["super_suffix_words"].add(token_count)
+                    word_lists["super_suffix_words"].add(word)
 
             if HALANTA in word:
                 subset_stats["halanta_words"].add(token_count)
+                word_lists["halanta_words"].add(word)
                 halanta_total += word.count(HALANTA)
                 halanta_cliffhangers += sum(
                     1 for tok in tokens_clean if tok.endswith(HALANTA)
@@ -471,6 +497,7 @@ def evaluate_sample(args: argparse.Namespace) -> dict:
             "currency_ascii": numeral_summary("currency_ascii"),
             "currency_mixed": numeral_summary("currency_mixed"),
         },
+        "word_lists": {key: sorted(words) for key, words in word_lists.items()},
     }
 
 
@@ -632,6 +659,27 @@ def write_markdown_report(result: dict, output_dir: str) -> None:
         f.write("- Document ratios are computed only for full documents in the sample.\n")
 
 
+def write_morphology_word_lists(result: dict, output_dir: str, label: str) -> None:
+    report_dir = os.path.join(output_dir, "reports")
+    os.makedirs(report_dir, exist_ok=True)
+
+    word_lists = result.get("word_lists", {})
+    for category in (
+        "suffix_words",
+        "halanta_words",
+        "super_suffix_words",
+        "chain_len_3_plus",
+    ):
+        words = word_lists.get(category, [])
+        file_path = os.path.join(report_dir, f"{label}_{category}.md")
+        title = category.replace("_", " ").title()
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(f"# {label} {title}\n\n")
+            f.write(f"- Count: {len(words)}\n\n")
+            for word in words:
+                f.write(f"- {word}\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate tiktoken encodings on a sampled IRIIS corpus subset."
@@ -654,6 +702,8 @@ def main() -> None:
     result = evaluate_sample(args)
     write_csv_reports(result, args.output_dir)
     write_markdown_report(result, args.output_dir)
+    label = safe_slug(args.model or args.encoding or "tiktoken")
+    write_morphology_word_lists(result, args.output_dir, label)
 
     print("Evaluation complete.")
     print(f"- Output directory: {args.output_dir}")

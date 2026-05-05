@@ -6,49 +6,49 @@
 - Domain column: Source
 - Tokenizer: sentencepiece
 - Seed: 13
-- Target words: 100,000
-- Actual words: 100,000
-- Documents used: 396
+- Target words: 4,000,000
+- Actual words: 4,000,000
+- Documents used: 17,057
 - Partial last doc: True
 
 ## Fertility Rate (Tokens per Word)
 | Subset | Words | Tokens | TPW | Min | Max | Mean | Median | P90 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| all | 100000 | 332079 | 3.3208 | 3 | 12 | 3.3208 | 3.0 | 4.0 |
-| suffix_words | 28848 | 104656 | 3.6278 | 3 | 12 | 3.6278 | 3.0 | 4.0 |
-| halanta_words | 35707 | 121391 | 3.3996 | 3 | 12 | 3.3996 | 3.0 | 4.0 |
-| super_suffix_words | 711 | 2576 | 3.6231 | 3 | 6 | 3.6231 | 4.0 | 4.0 |
-| chain_len_3plus | 15 | 63 | 4.2 | 3 | 7 | 4.2 | 4.0 | 5.0 |
+| all | 4000000 | 13209470 | 3.3024 | 3 | 27 | 3.3024 | 3.0 | 4.0 |
+| suffix_words | 1155515 | 4149045 | 3.5906 | 3 | 25 | 3.5906 | 3.0 | 4.0 |
+| halanta_words | 1428486 | 4822602 | 3.376 | 3 | 27 | 3.376 | 3.0 | 4.0 |
+| super_suffix_words | 28558 | 101436 | 3.5519 | 3 | 10 | 3.5519 | 3.0 | 4.0 |
+| chain_len_3plus | 803 | 3227 | 4.0187 | 3 | 8 | 4.0187 | 4.0 | 5.0 |
 
 ## T/W Ratio (Document Level)
-- Mean: 3.3066
-- Median: 3.2915792711916545
-- P90: 3.4550669216061185
-- Min: 3.074626865671642
-- Max: 4.0
+- Mean: 3.3008
+- Median: 3.2845849802371543
+- P90: 3.4404761904761907
+- Min: 3.0
+- Max: 4.446969696969697
 
 ## Numeral Density
 | Category | Spans | Tokens | Avg Tokens/Span |
 |---|---:|---:|---:|
-| dev_spans | 3251 | 10132 | 3.1166 |
+| dev_spans | 136937 | 427098 | 3.1189 |
 | ascii_spans | 0 | 0 | 0.0 |
-| phone_dev | 0 | 0 | 0.0 |
+| phone_dev | 20 | 140 | 7.0 |
 | phone_ascii | 0 | 0 | 0.0 |
-| currency_dev | 32 | 140 | 4.375 |
+| currency_dev | 2964 | 12563 | 4.2385 |
 | currency_ascii | 0 | 0 | 0.0 |
 | currency_mixed | 0 | 0 | 0.0 |
 
 Note: numeral spans can overlap categories (e.g., currency spans also contain digits).
 
 ## Conjunct Integrity (Halanta Cliffhangers)
-- Total halanta markers: 43764
-- Tokens ending with halanta: 2349
-- Integrity (1 - cliffhangers/total): 0.9463
+- Total halanta markers: 1767739
+- Tokens ending with halanta: 82628
+- Integrity (1 - cliffhangers/total): 0.9533
 
 ## Morphological Fragmentation (Postpositions)
-- Words with suffix chain: 28848
-- Words with fragmented suffix: 0
-- Fragmentation rate: 0.0
+- Words with suffix chain: 1155515
+- Words with fragmented suffix: 69
+- Fragmentation rate: 0.0001
 
 ## Notes
 - Suffix matching uses greedy longest-first stripping (max chain depth 6).

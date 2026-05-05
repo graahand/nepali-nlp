@@ -1,8 +1,8 @@
 category,spans,tokens,avg_tokens_per_span
-dev_spans,683455,972083,1.4223
+dev_spans,136937,195559,1.4281
 ascii_spans,0,0,0.0
-phone_dev,118,718,6.0847
+phone_dev,20,117,5.85
 phone_ascii,0,0,0.0
-currency_dev,14187,44040,3.1043
+currency_dev,2964,9263,3.1252
 currency_ascii,0,0,0.0
 currency_mixed,0,0,0.0
