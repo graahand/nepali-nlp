@@ -1,0 +1,6 @@
+subset,words,tokens,tpw,min_tokens,max_tokens,mean_tokens,median_tokens,p90_tokens
+all,100000,328080,3.2808,3,13,3.2808,3.0,4.0
+suffix_words,28848,99871,3.462,3,13,3.462,3.0,4.0
+halanta_words,35707,121086,3.3911,3,13,3.3911,3.0,4.0
+super_suffix_words,711,2502,3.519,3,9,3.519,3.0,4.0
+chain_len_3plus,15,57,3.8,3,7,3.8,4.0,4.0

@@ -1,0 +1,195 @@
+{
+  "main": {
+    "id": "a33dd56369c8baf6",
+    "type": "split",
+    "children": [
+      {
+        "id": "ba89a694f40c1ce5",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f29937ebfbf8468e",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "UniversalML_Evaluation/reports/universalml_iriis_report.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "universalml_iriis_report"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "59bc4710352bb06c",
+    "type": "split",
+    "children": [
+      {
+        "id": "9be5c54e5a72f975",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0c9e54008b7edbaa",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "f47a161e0515db90",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "11c7e639791af056",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "79748731380b2449",
+    "type": "split",
+    "children": [
+      {
+        "id": "b0176b16e070df64",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0d56095997c79c58",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "UniversalML_Evaluation/reports/universalml_iriis_report.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for universalml_iriis_report"
+            }
+          },
+          {
+            "id": "621554d3bd78b489",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "UniversalML_Evaluation/reports/universalml_iriis_report.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from universalml_iriis_report"
+            }
+          },
+          {
+            "id": "efeea07ebb1dcea2",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "7c36645ad72c078b",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "cb4f820d9e5aabfc",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "UniversalML_Evaluation/reports/universalml_iriis_report.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of universalml_iriis_report"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "f29937ebfbf8468e",
+  "lastOpenFiles": [
+    "commands.md",
+    "UniversalML_Evaluation/reports/universalml_iriis_report.md",
+    "UniversalML_Evaluation/reports/universalml_Nepali_Tokenizer_chain_len_3_plus.md",
+    "UniversalML_Evaluation/reports/universalml_Nepali_Tokenizer_halanta_words.md",
+    "UniversalML_Evaluation/reports/universalml_Nepali_Tokenizer_suffix_words.md",
+    "UniversalML_Evaluation/reports/universalml_Nepali_Tokenizer_super_suffix_words.md"
+  ]
+}
